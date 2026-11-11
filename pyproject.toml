@@ -38,8 +38,8 @@ dev = [
 rundeps = "rundeps.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/your-name/rundeps"
-Issues = "https://github.com/your-name/rundeps/issues"
+Homepage = "https://github.com/MElamins/rundeps"
+Issues = "https://github.com/MElamins/rundeps/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rundeps"]
