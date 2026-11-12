@@ -1,10 +1,33 @@
-"""Terminal output. Deliberately small: no UI framework, no emoji soup."""
+"""Terminal presentation.
+
+Everything that decides how RunDeps looks lives here, so the command layer can
+deal in data instead of escape sequences. Colour and symbols degrade on their
+own: redirected output, CI logs, ``NO_COLOR`` and legacy Windows consoles get
+plain ASCII with no escapes.
+"""
 
 from __future__ import annotations
 
 import os
 import sys
-from typing import TextIO
+from dataclasses import dataclass
+from typing import Iterable, Sequence, TextIO
+
+RULE_WIDTH = 45
+
+
+@dataclass(frozen=True)
+class Symbols:
+    ok: str
+    bad: str
+    warn: str
+    arrow: str
+    play: str
+    unknown: str
+
+
+UNICODE_SYMBOLS = Symbols(ok="✓", bad="✗", warn="!", arrow="→", play="▶", unknown="?")
+ASCII_SYMBOLS = Symbols(ok="+", bad="x", warn="!", arrow="->", play=">", unknown="?")
 
 
 def _supports_color(stream: TextIO) -> bool:
@@ -23,22 +46,20 @@ def _supports_color(stream: TextIO) -> bool:
 def _supports_unicode(stream: TextIO) -> bool:
     encoding = getattr(stream, "encoding", None) or "ascii"
     try:
-        "✓✗→".encode(encoding)
+        "✓→▶─".encode(encoding)
     except (UnicodeEncodeError, LookupError):
         return False
     return True
 
 
 class Console:
-    """Thin wrapper over stdout.
+    """Small formatter. Resolves the stream lazily so redirection still works."""
 
-    The stream is resolved on every call so redirecting ``sys.stdout`` (pipes,
-    test capture) keeps working after import time.
-    """
-
-    def __init__(self, stream: TextIO | None = None, *, color: bool | None = None) -> None:
+    def __init__(self, stream: TextIO | None = None, *, color: bool | None = None,
+                 unicode: bool | None = None) -> None:
         self._stream = stream
         self._color = color
+        self._unicode = unicode
 
     @property
     def stream(self) -> TextIO:
@@ -50,15 +71,15 @@ class Console:
 
     @property
     def unicode(self) -> bool:
-        return _supports_unicode(self.stream)
+        return self._unicode if self._unicode is not None else _supports_unicode(self.stream)
+
+    @property
+    def sym(self) -> Symbols:
+        return UNICODE_SYMBOLS if self.unicode else ASCII_SYMBOLS
 
     # -- primitives ---------------------------------------------------------
     def _paint(self, text: str, code: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self.color else text
-
-    def write(self, text: str = "") -> None:
-        print(text, file=self.stream)
-        self.stream.flush()
 
     def dim(self, text: str) -> str:
         return self._paint(text, "2")
@@ -75,56 +96,87 @@ class Console:
     def yellow(self, text: str) -> str:
         return self._paint(text, "33")
 
-    # -- marks --------------------------------------------------------------
+    def cyan(self, text: str) -> str:
+        return self._paint(text, "36")
+
     @property
     def ok_mark(self) -> str:
-        return self.green("✓" if self.unicode else "+")
+        return self.green(self.sym.ok)
 
     @property
     def bad_mark(self) -> str:
-        return self.red("✗" if self.unicode else "x")
+        return self.red(self.sym.bad)
 
     @property
     def warn_mark(self) -> str:
-        return self.yellow("!" if self.unicode else "!")
+        return self.yellow(self.sym.warn)
 
-    # -- structured output --------------------------------------------------
-    def banner(self, subtitle: str | None = None) -> None:
-        self.write(self.bold("RunDeps") + (f"  {self.dim(subtitle)}" if subtitle else ""))
+    @property
+    def play_mark(self) -> str:
+        return self.cyan(self.sym.play)
+
+    @property
+    def unknown_mark(self) -> str:
+        return self.yellow(self.sym.unknown)
+
+    @property
+    def arrow(self) -> str:
+        return self.sym.arrow
+
+    # -- layout -------------------------------------------------------------
+    def write(self, text: str = "") -> None:
+        print(text, file=self.stream)
+        self.stream.flush()
+
+    def blank(self) -> None:
+        self.write()
+
+    def rule(self) -> None:
+        self.write("  " + self.dim("─" * RULE_WIDTH))
+
+    def title(self, name: str) -> None:
+        self.write(f"  {self.cyan(self.bold('RunDeps'))} {self.dim('·')} {self.bold(name)}")
         self.rule()
 
-    def rule(self, width: int = 52) -> None:
-        self.write(self.dim("─" * width))
+    def status(self, mark: str, text: str) -> None:
+        self.write(f"  {mark} {text}")
 
-    def heading(self, text: str) -> None:
-        self.write()
-        self.write(self.bold(text))
+    def field(self, mark: str, label: str, value: str = "") -> None:
+        """A two-column status line: one glance gives one fact."""
+        gap = " " * max(2, 16 - len(label))
+        self.write(f"  {mark} {label}{gap}{value}".rstrip())
 
-    def item(self, mark: str, label: str, note: str = "") -> None:
-        tail = f"  {self.dim(note)}" if note else ""
-        self.write(f"  {mark} {label}{tail}")
+    def pairs(self, items: Iterable[tuple[str, str]], *, indent: str = "      ") -> None:
+        """Aligned ``import → package`` rows."""
+        rows = list(items)
+        if not rows:
+            return
+        width = max(len(left) for left, _ in rows)
+        for left, right in rows:
+            self.write(f"{indent}{left:<{width}}  {self.arrow} {right}")
 
-    def ok(self, label: str, note: str = "") -> None:
-        self.item(self.ok_mark, label, note)
+    def lines(self, lines: Sequence[str], *, indent: str = "      ") -> None:
+        for line in lines:
+            self.write(f"{indent}{line}")
 
-    def missing(self, label: str, note: str = "") -> None:
-        self.item(self.bad_mark, label, note)
+    def note(self, text: str) -> None:
+        self.write(f"  {text}")
 
-    def warn(self, label: str, note: str = "") -> None:
-        self.item(self.warn_mark, label, note)
+    def ok(self, text: str, extra: str = "") -> None:
+        """Green check plus an optional dim suffix."""
+        tail = f"  {self.dim(extra)}" if extra else ""
+        self.write(f"  {self.ok_mark} {text}{tail}")
 
-    def plain(self, text: str = "") -> None:
-        self.write(f"  {text}" if text else "")
-
-    def detail(self, text: str) -> None:
-        self.write(self.dim(f"  {text}"))
+    def warn(self, text: str, extra: str = "") -> None:
+        tail = f"  {self.dim(extra)}" if extra else ""
+        self.write(f"  {self.warn_mark} {text}{tail}")
 
     def hint(self, text: str) -> None:
-        self.write(self.dim(f"  {text}"))
+        self.write(f"  {self.dim(text)}")
 
     def error(self, text: str) -> None:
-        self.write()
-        self.write(f"{self.red('error')}: {text}")
+        self.blank()
+        self.write(f"  {self.red(self.sym.bad)} {self.red(text)}")
 
     # -- interaction --------------------------------------------------------
     def interactive(self) -> bool:
@@ -134,20 +186,20 @@ class Console:
             return False
 
     def ask(self, question: str, *, default: bool = True, assume: bool | None = None) -> bool:
-        """Ask a yes/no question.
+        """Yes/no prompt.
 
-        Without a readable terminal we never guess "yes": an unattended run must
-        not install anything the user did not approve with --yes.
+        Without a readable terminal the answer is No: an unattended run must
+        never install something the user did not approve with --yes.
         """
         if assume is not None:
             return assume
         if not self.interactive():
-            self.hint("No terminal available for confirmation; treating as No.")
+            self.hint("No terminal for confirmation; assuming No.")
             return False
 
         suffix = "[Y/n]" if default else "[y/N]"
         try:
-            answer = input(f"{question} {suffix} ").strip().lower()
+            answer = input(f"  {question} {suffix} ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             self.write()
             return False

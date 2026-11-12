@@ -25,9 +25,8 @@ def test_scan_reports_categories(plain_script, capsys):
     out = capsys.readouterr().out
 
     assert "Standard library" in out
-    assert "json" in out
-    assert "Missing" in out
-    assert "No files changed. No packages installed." in out
+    assert "Third-party" in out
+    assert "No changes made." in out
 
 
 def test_scan_resolves_mismatched_import_name(yaml_script, capsys):
@@ -45,8 +44,9 @@ def test_scan_marks_unknown_imports(monkeypatch, tmp_path, capsys):
     assert main(["scan", str(script)]) == 0
     out = capsys.readouterr().out
 
-    assert "Unknown" in out
+    assert "Unresolved" in out
     assert "something_weird" in out
+    assert "something-weird" in out
 
 
 def test_scan_does_not_create_project_files(plain_script):
@@ -178,7 +178,8 @@ def test_run_reports_success(tmp_path, capsys):
     out = capsys.readouterr().out
 
     assert "done" in out
-    assert "Process finished successfully." in out
+    assert "Dependencies" in out
+    assert "Done" in out
 
 
 def test_run_does_not_modify_the_script(yaml_script, tmp_path):
@@ -210,12 +211,36 @@ def test_init_is_idempotent(tmp_path):
     assert gitignore.read_text(encoding="utf-8").count(".rundeps") == 1
 
 
-def test_doctor_runs(tmp_path, capsys):
-    assert main(["doctor"]) == 0
+def test_scan_summarises_stdlib_instead_of_listing_it(yaml_script, capsys):
+    main(["scan", str(yaml_script)])
     out = capsys.readouterr().out
 
-    assert "Interpreter" in out
-    assert "venv" in out
+    # The summary counts stdlib; a normal scan must not dump every module name.
+    assert "Standard library" in out
+    assert "\n      os\n" not in out
+
+
+def test_run_does_not_list_stdlib_imports(tmp_path, capsys):
+    script = tmp_path / "many.py"
+    script.write_text("import os\nimport json\nimport uuid\nprint('ok')\n", encoding="utf-8")
+
+    main(["run", str(script), "--no-isolation"])
+    out = capsys.readouterr().out
+
+    assert "3 imports" in out
+    for name in ("os", "json", "uuid"):
+        assert f"{name} " not in out.replace("imports", "")
+
+
+def test_run_verbose_shows_diagnostics(tmp_path, capsys):
+    script = tmp_path / "diag.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+
+    main(["run", str(script), "--no-isolation", "--verbose"])
+    out = capsys.readouterr().out
+
+    assert "project:" in out
+    assert "environment:" in out
 
 
 def test_version_flag(capsys):

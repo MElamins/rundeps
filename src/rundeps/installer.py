@@ -9,7 +9,7 @@ from typing import Sequence
 from .environment import child_env
 from .names import is_valid_package_name
 from .output import console
-from .proc import run, tail
+from .proc import ProcessError, run, tail
 
 
 class InstallError(Exception):
@@ -40,9 +40,14 @@ def install(python: Path, packages: Sequence[str], *, venv: Path | None, verbose
             continue
 
         if verbose:
-            console.detail("pip install " + package)
+            console.hint("pip install " + package)
 
-        proc = run(_pip_cmd(python, [package]), env=child_env(venv), timeout=1800)
+        try:
+            proc = run(_pip_cmd(python, [package]), env=child_env(venv), timeout=1800)
+        except ProcessError as exc:
+            result.failed[package] = str(exc)
+            continue
+
         if proc.returncode == 0:
             result.ok.append(package)
         else:
@@ -53,7 +58,11 @@ def install(python: Path, packages: Sequence[str], *, venv: Path | None, verbose
 
 def require_pip(python: Path, *, venv: Path | None) -> str:
     """Confirm the target interpreter can run pip, and return its version."""
-    proc = run([str(python), "-m", "pip", "--version"], env=child_env(venv), timeout=300)
+    try:
+        proc = run([str(python), "-m", "pip", "--version"], env=child_env(venv), timeout=300)
+    except ProcessError as exc:
+        raise InstallError(f"cannot use {python}: {exc}") from exc
+
     if proc.returncode != 0:
         raise InstallError(
             f"{python} has no working pip.\n"

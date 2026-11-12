@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import platform
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -40,8 +41,13 @@ class Plan:
     unknown: list[Resolution] = field(default_factory=list)
 
     @property
-    def has_missing(self) -> bool:
-        return bool(self.missing)
+    def installable(self) -> list[Resolution]:
+        return [self.resolutions[name] for name in self.missing if self.resolutions[name].installable]
+
+    @property
+    def pairs(self) -> list[tuple[str, str]]:
+        return [(name, self.resolutions[name].package or name) for name in self.missing
+                if name in self.resolutions and self.resolutions[name].package]
 
 
 def build_resolver(project: Project | None) -> Resolver:
@@ -60,17 +66,31 @@ def build_resolver(project: Project | None) -> Resolver:
     return Resolver(index=index, mapping=mapping)
 
 
-def build_plan(analysis: Analysis, python: Path, resolver: Resolver) -> Plan:
+def build_plan(
+    analysis: Analysis,
+    resolver: Resolver,
+    python: Path | None,
+) -> Plan:
+    """Work out what is missing.
+
+    ``python=None`` means the target environment does not exist yet, so every
+    third-party import is missing by definition -- that is the honest answer for
+    a virtual environment that is about to be created empty.
+    """
     plan = Plan(analysis=analysis)
     wanted = analysis.third_party
     if not wanted:
         return plan
 
     resolved = {name: resolver.resolve(name, analysis.module_for(name)) for name in wanted}
-    try:
-        status = probe(python, [(name, resolved[name].package or "") for name in wanted])
-    except EnvProblem:
-        status = {}
+
+    if python is None:
+        status: dict[str, dict] = {}
+    else:
+        try:
+            status = probe(python, [(name, resolved[name].package or "") for name in wanted])
+        except EnvProblem:
+            status = {}
 
     for name in wanted:
         info = status.get(name) or {}
@@ -96,57 +116,9 @@ def _visible_python(project: Project) -> Path:
 def _ensure_venv(project: Project) -> Path:
     if project.python.exists():
         return project.python
-    console.write()
-    console.write("Creating isolated environment...")
-    python = create_venv(project.venv_dir)
-    console.ok("Environment ready", str(project.venv_dir))
-    return python
-
-
-def _print_imports(plan: Plan) -> None:
-    analysis = plan.analysis
-    console.heading("Imports found")
-    if not analysis.imports:
-        console.plain(console.dim("none"))
-        return
-
-    stdlib = [record.name for record in analysis.imports if record.kind.value == "stdlib"]
-    local = [record.name for record in analysis.imports if record.kind.value == "local"]
-
-    for record in analysis.imports:
-        if record.kind.value == "stdlib":
-            console.item(console.ok_mark, record.name, "standard library")
-        elif record.kind.value == "local":
-            console.item(console.ok_mark, record.name, "local")
-        elif record.name in plan.found:
-            version = plan.found[record.name]
-            console.item(console.ok_mark, record.name, f"installed {version}" if version else "installed")
-        else:
-            console.item(console.bad_mark, record.name, "missing")
-
-    if stdlib:
-        console.detail(f"{len(stdlib)} standard library import(s)")
-    if local:
-        console.detail(f"{len(local)} local import(s)")
-
-
-def _print_resolution(plan: Plan) -> None:
-    if plan.resolutions:
-        console.heading("Resolving missing imports")
-        width = max(len(name) for name in plan.resolutions)
-        for name, resolution in plan.resolutions.items():
-            console.plain(f"{name:<{width}}  →  {resolution.package}")
-
-    if plan.unknown:
-        console.heading("Could not confidently resolve")
-        for resolution in plan.unknown:
-            console.item(console.warn_mark, resolution.import_name)
-            console.plain(console.dim(f"possible package: {resolution.package}  (low confidence)"))
-        console.write()
-        console.hint("RunDeps will not install these automatically.")
-        console.hint("If you know the package, install it explicitly and rerun:")
-        for resolution in plan.unknown:
-            console.hint(f"  rundeps install {resolution.package}")
+    console.blank()
+    console.hint("Creating isolated environment...")
+    return create_venv(project.venv_dir)
 
 
 def _install_packages(
@@ -159,19 +131,26 @@ def _install_packages(
     require_pip(python, venv=venv_dir)
     result = install(python, packages, venv=venv_dir, verbose=verbose)
 
-    for name in result.ok:
-        console.ok(f"Installed {name}")
+    versions: dict[str, str | None] = {}
+    if result.ok:
+        try:
+            status = probe(python, [(name, name) for name in result.ok])
+        except EnvProblem:
+            status = {}
+        versions = {name: (status.get(name) or {}).get("version") for name in result.ok}
+
+        width = max(len(name) for name in result.ok)
+        for name in result.ok:
+            version = versions.get(name)
+            console.write(f"  {console.ok_mark} {name:<{width}}  {console.dim(version) if version else ''}".rstrip())
+
     for name, detail in result.failed.items():
         console.error(f"could not install {name}")
         for line in detail.splitlines()[-6:]:
             console.hint(line)
 
     if result.ok and project.initialised:
-        try:
-            status = probe(python, [(name, name) for name in result.ok])
-        except EnvProblem:
-            status = {}
-        record_packages(project, {name: (status.get(name) or {}).get("version") for name in result.ok})
+        record_packages(project, versions)
 
     return list(result.ok)
 
@@ -185,21 +164,45 @@ def _write_stream(text: str) -> None:
     sys.stdout.flush()
 
 
-def _report_exit(code: int) -> int:
-    console.write()
+def _elapsed(started: float) -> str:
+    return f"{time.monotonic() - started:.2f}s"
+
+
+def _summary(analysis: Analysis, plan: Plan) -> None:
+    total = len(analysis.imports)
+    missing = len(plan.missing)
+    noun = "import" if total == 1 else "imports"
+
+    if not missing:
+        console.field(console.ok_mark, "Dependencies", console.dim(f"{total} {noun} · all available"))
+        return
+
+    console.field(console.warn_mark, "Dependencies", f"{total} {noun} · {missing} missing")
+    console.blank()
+    console.pairs(plan.pairs)
+
+    if plan.unknown:
+        console.blank()
+        for resolution in plan.unknown:
+            console.write(f"      {console.unknown_mark} {resolution.import_name}")
+            console.write(f"        {console.dim('possible package:')} {resolution.package}")
+            console.write(f"        {console.dim('confidence:')} {resolution.confidence.value}")
+        console.blank()
+        console.note("RunDeps won't install these automatically.")
+        console.blank()
+        console.hint("Install manually:")
+        for resolution in plan.unknown:
+            console.hint(f"  rundeps install {resolution.package}")
+
+
+def _finish(code: int, started: float) -> int:
+    console.blank()
+    console.rule()
     if code == 0:
-        console.write(console.green("Process finished successfully."))
+        console.field(console.ok_mark, "Done", console.dim(_elapsed(started)))
     else:
-        console.write(console.red(f"Process exited with code {code}."))
+        console.field(console.bad_mark, "Failed", console.dim(_elapsed(started)))
     return code
-
-
-def _list_or_none(names) -> None:
-    names = list(names)
-    if not names:
-        console.plain(console.dim("none"))
-    for name in names:
-        console.plain(name)
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +210,6 @@ def _list_or_none(names) -> None:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     script = Path(args.script)
-    project = Project.locate(script)
 
     try:
         analysis = analyze(script)
@@ -215,43 +217,50 @@ def cmd_scan(args: argparse.Namespace) -> int:
         console.error(str(exc))
         return 2
 
-    console.banner()
-    console.heading("Script")
-    console.plain(str(script))
+    project = Project.locate(script)
+    resolver = build_resolver(project)
+    plan = build_plan(analysis, resolver, _visible_python(project))
 
-    python = _visible_python(project)
-    plan = build_plan(analysis, python, build_resolver(project))
+    console.title("dependency scan")
+    console.blank()
 
-    console.heading("Standard library")
-    _list_or_none(plan.analysis.stdlib)
-    console.heading("Local")
-    _list_or_none(plan.analysis.local)
-    console.heading("Installed")
-    _list_or_none(sorted(plan.found, key=str.lower))
-    console.heading("Missing")
-    _list_or_none(plan.missing)
+    third_party = len(analysis.third_party)
+    console.field(console.ok_mark, "Standard library", str(len(analysis.stdlib)))
+    if analysis.local:
+        console.field(console.ok_mark, "Local", str(len(analysis.local)))
+    console.field(console.ok_mark, "Third-party", str(third_party))
 
-    if plan.resolutions:
-        console.heading("Resolved packages")
-        width = max(len(name) for name in plan.resolutions)
-        for name, resolution in plan.resolutions.items():
-            console.plain(f"{name:<{width}}  →  {resolution.package}")
+    if plan.missing:
+        console.field(console.warn_mark, "Missing", str(len(plan.missing)))
+        console.blank()
+        console.pairs(plan.pairs)
+    else:
+        console.field(console.ok_mark, "Missing", "none")
 
-    console.heading("Unknown")
-    _list_or_none([item.import_name for item in plan.unknown])
+    if plan.unknown:
+        console.blank()
+        console.field(console.warn_mark, "Unresolved", str(len(plan.unknown)))
+        for resolution in plan.unknown:
+            console.write(f"      {resolution.import_name}{console.dim(f'  (possible: {resolution.package})')}")
 
-    console.write()
-    console.detail(f"Interpreter: {python}")
-    console.write("No files changed. No packages installed.")
+    if args.verbose:
+        console.blank()
+        console.hint(f"script:      {script}")
+        console.hint(f"interpreter: {_visible_python(project)}")
+        if analysis.stdlib:
+            console.hint("stdlib:      " + ", ".join(analysis.stdlib))
+        if analysis.local:
+            console.hint("local:       " + ", ".join(analysis.local))
+
+    console.blank()
+    console.hint("No changes made.")
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     script = Path(args.script)
     project = Project.locate(script)
-
-    console.banner()
-    console.write(f"Scanning {script.name}...")
+    started = time.monotonic()
 
     try:
         analysis = analyze(script)
@@ -260,90 +269,85 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
 
     resolver = build_resolver(project)
-    probe_python = Path(sys.executable) if args.no_isolation else _visible_python(project)
-    plan = build_plan(analysis, probe_python, resolver)
+    isolated = not args.no_isolation
+    venv_exists = project.python.exists()
 
-    _print_imports(plan)
-    _print_resolution(plan)
-
-    console.write()
-    if plan.has_missing:
-        console.warn(f"{len(plan.missing)} missing {'dependency' if len(plan.missing) == 1 else 'dependencies'}")
+    # A fresh isolated environment is empty, so probing it is pointless: every
+    # third-party import is missing until we install it.
+    probe_python: Path | None
+    if not isolated:
+        probe_python = Path(sys.executable)
+    elif venv_exists:
+        probe_python = project.python
     else:
-        console.ok("No missing dependencies")
+        probe_python = None
 
-    if args.no_isolation:
-        console.write()
-        console.warn("Isolation is off", "packages would go into your current environment")
+    plan = build_plan(analysis, resolver, probe_python)
+
+    console.title(script.name)
+    console.blank()
+    _summary(analysis, plan)
 
     if args.verbose:
-        console.write()
-        console.detail(f"interpreter: {probe_python}")
-        console.detail(f"project:     {project.root}")
-        console.detail(f"environment: {'current python' if args.no_isolation else project.venv_dir}")
+        console.blank()
+        console.hint(f"project:     {project.root}")
+        console.hint(f"environment: {'current python' if not isolated else project.venv_dir}")
         for resolution in plan.resolutions.values():
-            console.detail(f"{resolution.import_name}: {resolution.reason}")
+            console.hint(f"{resolution.import_name}: {resolution.reason}")
 
     if args.dry_run:
-        console.heading("Dry run: nothing will be installed or executed")
+        console.blank()
+        console.field(console.cyan("~"), "Dry run", console.dim("nothing installed, nothing executed"))
         if plan.packages:
-            console.plain("Would install:")
+            console.blank()
+            console.note("Would install:")
             for package in plan.packages:
-                console.plain(f"  {package}")
+                console.write(f"      {package}")
         else:
-            console.plain("Nothing to install.")
-        if plan.unknown:
-            console.write()
-            console.plain("Would skip (low confidence):")
-            for resolution in plan.unknown:
-                console.plain(f"  {resolution.import_name}  (possible: {resolution.package})")
+            console.blank()
+            console.hint("Nothing to install.")
         return 0
 
-    target_python = probe_python
-    venv_dir = None
-    if not args.no_isolation and project.python.exists():
-        venv_dir = project.venv_dir
+    if isolated:
+        if venv_exists:
+            target_python, venv_dir = project.python, project.venv_dir
+        else:
+            try:
+                target_python = _ensure_venv(project)
+            except EnvProblem as exc:
+                console.error(str(exc))
+                if plan.packages:
+                    console.hint("Re-run with --no-isolation to use the current environment.")
+                return 1
+            venv_dir = project.venv_dir
+    else:
+        target_python, venv_dir = Path(sys.executable), None
 
-    install_list = plan.packages
+    if plan.packages:
+        console.blank()
+        noun = "package needs" if len(plan.packages) == 1 else "packages need"
+        destination = "the current environment" if not isolated else f"{PROJECT_DIR}/venv"
+        console.note(f"{len(plan.packages)} {noun} to be installed.")
 
-    if install_list and not args.no_isolation:
-        try:
-            target_python = _ensure_venv(project)
-        except EnvProblem as exc:
-            console.error(str(exc))
-            console.hint("Re-run with --no-isolation to use the current environment.")
-            return 1
-        venv_dir = project.venv_dir
-
-        if target_python != probe_python:
-            # A fresh environment has none of the script's dependencies yet,
-            # so the authoritative plan is the one for that interpreter.
-            plan = build_plan(analysis, target_python, resolver)
-            install_list = plan.packages
-
-    if install_list:
-        console.heading(f"Install {len(install_list)} package(s)")
-        for package in install_list:
-            console.plain(package)
-        console.write()
-        if not console.ask("Proceed?", assume=True if args.yes else None):
-            console.write()
+        if not console.ask(f"Install into {destination}?", assume=True if args.yes else None):
+            console.blank()
             console.hint("Nothing installed.")
             if plan.missing:
                 console.hint(f"The script needs: {', '.join(plan.missing)}")
             return 1
-        console.write()
+
+        console.blank()
         try:
-            installed = _install_packages(target_python, install_list, venv_dir, project, args.verbose)
+            installed = _install_packages(target_python, plan.packages, venv_dir, project, args.verbose)
         except (InstallError, EnvProblem) as exc:
             console.error(str(exc))
             return 1
         if not installed:
             return 1
 
-    console.write()
-    console.write(f"Running {script.name}")
-    console.rule()
+    console.blank()
+    console.field(console.cyan("i"), "Environment", console.dim(_python_label(target_python)))
+    console.write(f"  {console.play_mark} {console.dim('Running')}")
 
     attempts: set[str] = set()
     retries = 0
@@ -352,69 +356,108 @@ def cmd_run(args: argparse.Namespace) -> int:
         try:
             result = run_script(target_python, script, args.script_args, venv=venv_dir)
         except KeyboardInterrupt:
-            console.write()
+            console.blank()
             return 130
 
-        _write_stream(result.stdout)
-        if result.stderr:
-            sys.stderr.write(result.stderr)
-            sys.stderr.flush()
+        if result.stdout:
+            _write_stream(result.stdout)
 
         if result.returncode == 0:
-            return _report_exit(0)
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+                sys.stderr.flush()
+            return _finish(0, started)
 
         name = missing_module(result.stderr)
+
         if name is None:
-            return _report_exit(result.returncode)
+            # Not a dependency problem: report the error, keep the noise down.
+            _show_failure(result.stderr, verbose=args.verbose)
+            return _finish(result.returncode, started)
 
         if name in attempts:
             console.error(f"{script.name} still cannot import {name} after installing it")
-            return result.returncode
+            return _finish(result.returncode, started)
 
         if name in local_module_names(script) or is_stdlib(name):
-            # A broken import inside the project is not a packaging problem.
-            return _report_exit(result.returncode)
+            _show_failure(result.stderr, verbose=args.verbose)
+            return _finish(result.returncode, started)
 
         if retries >= args.max_retries:
-            console.write()
+            _show_failure(result.stderr, verbose=args.verbose)
             console.hint(f"Reached the retry limit ({args.max_retries}).")
-            return result.returncode
+            return _finish(result.returncode, started)
 
         resolution = resolver.resolve(name)
-        console.write()
-        console.write(console.warn_mark + " RunDeps detected a missing runtime dependency.")
-        console.plain(f"import:      {name}")
-        console.plain(f"package:     {resolution.package}")
-        console.plain(f"confidence:  {resolution.confidence.value}")
-        console.plain(f"evidence:    {resolution.reason}")
+        _show_failure(result.stderr, verbose=args.verbose)
+
+        console.blank()
+        console.note("RunDeps can resolve this dependency.")
+        console.blank()
+        console.pairs([(name, resolution.package or name)])
+        console.write(f"      {console.dim('confidence:')} {resolution.confidence.value}")
 
         if not resolution.installable:
-            console.write()
-            console.hint("Confidence is too low to install automatically.")
-            console.hint(f"If you know the package: rundeps install {resolution.package}")
-            return result.returncode
+            console.blank()
+            console.note("Confidence is too low to install automatically.")
+            console.blank()
+            console.hint("Install manually:")
+            console.hint(f"  rundeps install {resolution.package}")
+            return _finish(result.returncode, started)
 
+        console.blank()
         approved = console.ask(
             f"Install {resolution.package} and retry?",
             assume=True if args.yes and resolution.trusted else None,
         )
         if not approved:
-            return result.returncode
+            console.blank()
+            console.hint("RunDeps stopped without changing anything.")
+            console.hint(f"Tip: rundeps install {resolution.package}")
+            return _finish(result.returncode, started)
 
         attempts.add(name)
         retries += 1
+        console.blank()
         try:
             installed = _install_packages(target_python, [resolution.package or name], venv_dir, project, args.verbose)
         except (InstallError, EnvProblem) as exc:
             console.error(str(exc))
-            return result.returncode
+            return _finish(result.returncode, started)
 
         if not installed:
-            return result.returncode
+            return _finish(result.returncode, started)
 
-        console.write()
-        console.write(f"Retrying {script.name}")
-        console.rule()
+        console.blank()
+        console.write(f"  {console.play_mark} {console.dim(f'Retrying {script.name}')}")
+
+
+def _python_label(python: Path) -> str:
+    return f"Python {platform.python_version()} · {python}"
+
+
+def _show_failure(stderr: str, *, verbose: bool) -> None:
+    """One readable error block. The traceback is opt-in."""
+    console.blank()
+    console.write(f"  {console.bad_mark} {console.red('Process failed')}")
+    console.blank()
+
+    if verbose:
+        for line in (stderr or "").rstrip().splitlines()[-40:]:
+            console.hint(line)
+        return
+
+    lines = [line.strip() for line in (stderr or "").strip().splitlines() if line.strip()]
+    detail = lines[-2:] if len(lines) >= 2 else lines
+
+    for line in detail:
+        # "ModuleNotFoundError: No module named 'x'" reads better split up.
+        if ": " in line:
+            kind, _, message = line.partition(": ")
+            console.write(f"      {kind}")
+            console.write(f"      {message}")
+        else:
+            console.write(f"      {line}")
 
 
 def cmd_requirements(args: argparse.Namespace) -> int:
@@ -429,7 +472,7 @@ def cmd_requirements(args: argparse.Namespace) -> int:
     project = Project.locate(script)
     resolver = build_resolver(project)
     python = args.interpreter or _visible_python(project)
-    plan = build_plan(analysis, python, resolver)
+    plan = build_plan(analysis, resolver, python)
 
     names = sorted(set(plan.found) | set(plan.missing), key=str.lower)
     resolutions = {name: resolver.resolve(name, analysis.module_for(name)) for name in names}
@@ -459,21 +502,22 @@ def cmd_requirements(args: argparse.Namespace) -> int:
     target = Path(args.output) if args.output else script.parent / "requirements.txt"
 
     if args.dry_run:
-        console.banner()
-        console.plain(f"Would write {target}:")
-        console.write()
+        console.title("requirements")
+        console.blank()
+        console.hint(f"Would write {target}:")
+        console.blank()
         sys.stdout.write(text)
         if skipped:
             console.hint(f"skipped {len(skipped)} unresolved import(s)")
         return 0
 
     target.write_text(text, encoding="utf-8")
-    console.banner()
-    console.ok(f"Wrote {target}", f"{len(lines)} package(s)")
+    console.title("requirements")
+    console.blank()
+    console.ok(f"Wrote {target}")
+    console.hint(f"{len(lines)} package(s)")
     for resolution in skipped:
-        console.warn(resolution.import_name, f"unresolved, possible: {resolution.package}")
-    if not args.freeze:
-        console.hint("Use --freeze to pin versions RunDeps recorded.")
+        console.hint(f"unresolved: {resolution.import_name} (possible: {resolution.package})")
     return 0
 
 
@@ -482,12 +526,14 @@ def cmd_init(args: argparse.Namespace) -> int:
     root.mkdir(parents=True, exist_ok=True)
     project = Project(root)
 
-    console.banner()
+    console.title("init")
+    console.blank()
+
     project.dir.mkdir(exist_ok=True)
-    console.write(f"Created {PROJECT_DIR}/")
+    console.ok(f"{PROJECT_DIR}/")
 
     if project.config_path.exists() and not args.force:
-        console.hint(f"{PROJECT_DIR}/config.toml already exists, left untouched")
+        console.hint(f"{PROJECT_DIR}/config.toml exists, left untouched")
     else:
         project.config_path.write_text(
             "# RunDeps project configuration.\n"
@@ -496,12 +542,12 @@ def cmd_init(args: argparse.Namespace) -> int:
             f"max_retries = {DEFAULT_MAX_RETRIES}\n",
             encoding="utf-8",
         )
-        console.write(f"Created {PROJECT_DIR}/config.toml")
+        console.ok(f"{PROJECT_DIR}/config.toml")
 
     ignore_inside = project.dir / ".gitignore"
     if not ignore_inside.exists():
         ignore_inside.write_text("*\n!.gitignore\n", encoding="utf-8")
-        console.write(f"Created {PROJECT_DIR}/.gitignore")
+        console.ok(f"{PROJECT_DIR}/.gitignore")
 
     gitignore = root / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
@@ -509,19 +555,21 @@ def cmd_init(args: argparse.Namespace) -> int:
         prefix = "" if not existing or existing.endswith("\n") else "\n"
         with gitignore.open("a", encoding="utf-8") as handle:
             handle.write(f"{prefix}{PROJECT_DIR}/\n")
-        console.write("Added .rundeps/ to .gitignore")
+        console.ok("Added .rundeps/ to .gitignore")
 
-    console.write()
-    console.ok("Ready", "rundeps run <script>")
+    console.blank()
+    console.hint("Next: rundeps run <script>")
     return 0
 
 
 def cmd_install(args: argparse.Namespace) -> int:
     project = Project.locate(Path.cwd())
-    console.banner()
+
+    console.title("install")
+    console.blank()
 
     if args.no_isolation:
-        console.warn("Installing into the current environment", "less safe")
+        console.field(console.warn_mark, "Environment", "current python (less safe)")
         python, venv_dir = Path(sys.executable), None
     else:
         try:
@@ -530,14 +578,16 @@ def cmd_install(args: argparse.Namespace) -> int:
             console.error(str(exc))
             return 1
         venv_dir = project.venv_dir
+        console.field(console.ok_mark, "Environment", str(project.venv_dir))
 
-    console.plain("Packages: " + ", ".join(args.packages))
-    console.write()
+    console.blank()
+    console.pairs([(name, "") for name in args.packages])
+
     if not console.ask(f"Install {len(args.packages)} package(s)?", assume=True if args.yes else None):
         console.hint("Nothing installed.")
         return 1
 
-    console.write()
+    console.blank()
     try:
         installed = _install_packages(python, args.packages, venv_dir, project, args.verbose)
     except (InstallError, EnvProblem) as exc:
@@ -555,46 +605,40 @@ def _has_module(name: str) -> bool:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    console.banner()
+    console.title("doctor")
+    console.blank()
 
-    console.heading("Interpreter")
-    console.plain(f"executable:  {sys.executable}")
-    console.plain(f"version:     {platform.python_version()} ({platform.python_implementation()})")
-    console.plain(f"platform:    {platform.system()} {platform.release()}")
-
-    console.heading("Capabilities")
     checks = [
-        ("venv module", _has_module("venv")),
-        ("pip module", _has_module("pip")),
-        ("tomllib (config parsing)", _has_module("tomllib")),
-        ("stdlib module list", hasattr(sys, "stdlib_module_names")),
+        ("venv", _has_module("venv")),
+        ("pip", _has_module("pip")),
+        ("tomllib", _has_module("tomllib")),
+        ("stdlib list", hasattr(sys, "stdlib_module_names")),
     ]
+    healthy = all(ok for _, ok in checks[:2])
+
+    console.field(console.ok_mark, "Python", f"{platform.python_version()} ({platform.python_implementation()})")
+    console.field(console.ok_mark, "Platform", f"{platform.system()} {platform.release()}")
+    console.blank()
     for label, available in checks:
-        console.item(console.ok_mark if available else console.bad_mark, label)
+        console.field(console.ok_mark if available else console.bad_mark, label,
+                      "" if available else console.dim("missing"))
+    console.blank()
+    console.field(console.ok_mark, "Mappings", f"{len(load_import_map())} import-to-package rules")
 
-    console.heading("Mapping data")
-    console.plain(f"{len(load_import_map())} known import-to-package mappings")
-
-    console.heading("Project")
-    project = Project.locate(Path.cwd() / ".")
-    console.plain(f"root:        {project.root}")
+    project = Project.locate(Path.cwd())
+    console.blank()
     if project.initialised:
-        console.item(console.ok_mark, f"{PROJECT_DIR}/", "initialised")
-        console.plain(f"environment: {'ready' if project.python.exists() else 'not created yet'}")
-        if project.python.exists():
-            console.plain(f"interpreter: {project.python}")
+        console.field(console.ok_mark, "Project", str(project.root))
+        console.field(console.ok_mark, "Environment",
+                      "ready" if project.python.exists() else "not created yet")
     else:
-        console.item(console.warn_mark, f"{PROJECT_DIR}/", "not initialised (run: rundeps init)")
+        console.field(console.warn_mark, "Project", "not initialised (run: rundeps init)")
 
-    console.heading("Install target")
-    if args.no_isolation:
-        console.item(console.warn_mark, "current environment", "--no-isolation requested")
+    console.blank()
+    if healthy:
+        console.hint("No blocking problems found.")
     else:
-        console.item(console.ok_mark, "project-local virtual environment", "default")
-
-    healthy = all(available for _, available in checks[:2])
-    console.write()
-    console.write("No blocking problems found." if healthy else "At least one required capability is missing.")
+        console.hint("venv and pip are required.")
     return 0 if healthy else 1
 
 
@@ -614,7 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--dry-run", action="store_true", help="show the plan without installing or running")
     run_parser.add_argument("--yes", "-y", action="store_true", help="approve high-confidence installs")
     run_parser.add_argument("--no-isolation", action="store_true", help="use the current environment (less safe)")
-    run_parser.add_argument("--verbose", "-v", action="store_true", help="show diagnostic detail")
+    run_parser.add_argument("--verbose", "-v", action="store_true", help="show diagnostics and full tracebacks")
     run_parser.add_argument(
         "--max-retries",
         type=int,
@@ -626,6 +670,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan_parser = sub.add_parser("scan", help="report dependencies without changing anything")
     scan_parser.add_argument("script", help="path to the .py file")
+    scan_parser.add_argument("--verbose", "-v", action="store_true")
     scan_parser.set_defaults(func=cmd_scan)
 
     req_parser = sub.add_parser("requirements", help="write a requirements.txt for a script")
@@ -676,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except KeyboardInterrupt:
-        console.write()
+        console.blank()
         return 130
     except BrokenPipeError:
         return 1

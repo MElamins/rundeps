@@ -76,26 +76,25 @@ rundeps run examples/missing_dependency.py
 That script imports `requests` and `yaml`. If neither is available, you get:
 
 ```text
-RunDeps
-────────────────────────────────────────────────────
-Scanning missing_dependency.py...
+  RunDeps · missing_dependency.py
+  ─────────────────────────────────────────────
 
-Imports found
-  ✓ sys        standard library
-  ✗ requests   missing
-  ✗ yaml       missing
+  ! Dependencies    3 imports · 2 missing
 
-Resolving missing imports
-  requests  →  requests
-  yaml      →  PyYAML
+      requests  → requests
+      yaml      → PyYAML
 
-! 2 missing dependencies
+  2 packages need to be installed.
 
-Install 2 package(s)
-  requests
-  PyYAML
+  Install into .rundeps/venv? [Y/n]
+  ✓ requests  2.32.5
+  ✓ PyYAML    6.0.3
 
-Proceed? [Y/n]
+  i Environment     Python 3.12.7 · .rundeps/venv/bin/python
+  ▶ Running
+
+  ─────────────────────────────────────────────
+  ✓ Done            1.24s
 ```
 
 Answer yes and RunDeps creates `.rundeps/venv`, installs into it, and runs your
@@ -128,7 +127,7 @@ rundeps run  examples/missing_dependency.py --dry-run
 | `--dry-run` | Show the plan. Installs nothing, runs nothing. |
 | `--yes`, `-y` | Approve **high-confidence** installs only. Low-confidence guesses are still refused. |
 | `--no-isolation` | Use the current environment instead of `.rundeps/venv`. Less safe, clearly labelled. |
-| `--verbose`, `-v` | Show the interpreter, project root, and why each import resolved. |
+| `--verbose`, `-v` | Show diagnostics (interpreter, project root, resolution evidence) and the full traceback on failure. |
 | `--max-retries N` | How many runtime dependency retries to allow (default `3`). |
 
 ### Passing arguments to your script
@@ -183,14 +182,19 @@ be installed after you say yes; it is never installed unattended.
 
 ```text
 $ rundeps scan weird.py
+  RunDeps · dependency scan
+  ─────────────────────────────────────────────
 
-Could not confidently resolve
-  ! something_weird
-    possible package: something-weird  (low confidence)
+  ✓ Standard library  0
+  ✓ Third-party     1
+  ! Missing         1
 
-  RunDeps will not install these automatically.
-  If you know the package, install it explicitly and rerun:
-    rundeps install something-weird
+      something_weird  → something-weird
+
+  ! Unresolved      1
+      something_weird  (possible: something-weird)
+
+  No changes made.
 ```
 
 That is the whole policy: **uncertainty never turns into an installation.**
@@ -203,17 +207,33 @@ behind a branch. So after running your script, RunDeps watches for a
 one targeted install-and-retry:
 
 ```text
-Running runtime_import.py
-────────────────────────────────────────────────────
+  RunDeps · runtime_import.py
+  ─────────────────────────────────────────────
+
+  ✓ Dependencies    1 import · all available
+
+  i Environment     Python 3.12.7 · .rundeps/venv/bin/python
+  ▶ Running
 humanize: not available yet
 
-! RunDeps detected a missing runtime dependency.
-  import:      humanize
-  package:     humanize
-  confidence:  medium
-  evidence:    import name matches project name
+  ✗ Process failed
 
-Install humanize and retry? [Y/n]
+      ModuleNotFoundError
+      No module named 'humanize'
+
+  RunDeps can resolve this dependency.
+
+      humanize  → humanize
+      confidence: medium
+
+  Install and retry? [Y/n]
+  ✓ humanize  4.9.0
+
+  ▶ Retrying runtime_import.py
+humanize: humanize
+
+  ─────────────────────────────────────────────
+  ✓ Done            1.02s
 ```
 
 Retries are capped by `--max-retries` (default 3), each module is attempted once,
